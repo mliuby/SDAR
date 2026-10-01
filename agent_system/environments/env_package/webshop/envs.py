@@ -120,7 +120,9 @@ class WebshopMultiProcessEnv(gym.Env):
         env_worker = ray.remote(**resources_per_worker)(WebshopWorker)
         self._workers = []
         for i in range(self.num_processes):
-            worker = env_worker.remote(seed + (i // self.group_n), self._env_kwargs)
+            # A session index is only stable when every worker uses the same
+            # goal-shuffle seed. Group diversity comes from distinct sessions.
+            worker = env_worker.remote(seed, self._env_kwargs)
             self._workers.append(worker)
 
         # Get goals from the first worker
@@ -185,7 +187,8 @@ class WebshopMultiProcessEnv(gym.Env):
         # Collect results
         results = ray.get(futures)
         obs_list, info_list = [], []
-        for obs, info in results:
+        for idx_i, (obs, info) in zip(idx, results):
+            info["session_idx"] = int(idx_i)
             obs_list.append(obs)
             info_list.append(info)
 

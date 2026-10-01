@@ -202,17 +202,25 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
     reward_tensor = data.batch['token_level_scores']
     if 'step_rewards' in data.batch.keys():
         step_rewards = data.batch['step_rewards']
-    for i in range(len(data)):
+
+    # DataProto integer indexing returns non-tensor values as scalars. Depending
+    # on how rows were produced or concatenated, a validity value may therefore
+    # be a Python bool, a NumPy scalar, or a one-element ndarray. Normalize the
+    # complete column once instead of assuming every scalar implements astype.
+    action_valids = []
+    for value in data.non_tensor_batch['is_action_valid']:
+        array = np.asarray(value, dtype=np.float32)
+        if array.size != 1:
+            raise ValueError(f'Expected one is_action_valid value per row, got shape {array.shape}')
+        action_valids.append(float(array.reshape(-1)[0]))
+    action_valids = np.asarray(action_valids, dtype=np.float32)
+
+    for i, action_valid in enumerate(action_valids):
         data_item = data[i]  # DataProtoItem
-
         prompt_ids = data_item.batch['prompts']
-
         prompt_length = prompt_ids.shape[-1]
-
         valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-
-        action_valids = data_item.non_tensor_batch['is_action_valid'].astype(np.float32)
-        action_invalids = torch.tensor(1 - action_valids, dtype=torch.float32, device=prompt_ids.device).squeeze(0)
+        action_invalids = torch.tensor(1.0 - action_valid, dtype=torch.float32, device=prompt_ids.device)
         # invalid action penalty
         # assert reward_tensor[i, valid_response_length - 1] != 0.0, f'i={i}'
         reward_tensor[i, valid_response_length - 1] -= invalid_action_penalty_coef * action_invalids
@@ -220,7 +228,7 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
         if 'step_rewards' in data.batch.keys():
             step_rewards[i] -= invalid_action_penalty_coef * action_invalids
     
-    valid_action_ratio = np.mean(data.non_tensor_batch['is_action_valid'].astype(np.float32)).item()
+    valid_action_ratio = action_valids.mean().item()
     metrics = {'episode/valid_action_ratio': valid_action_ratio}
     return data, metrics
 

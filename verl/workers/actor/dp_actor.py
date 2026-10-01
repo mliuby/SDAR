@@ -37,6 +37,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
+from verl.trainer.ppo.ovcsd_utils import topk_tail_kl
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -230,6 +231,50 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
+    def _forward_selected_logits(self, micro_batch, temperature, sel_mask):
+        """Return full-vocabulary logits only at selected response positions."""
+        assert not self.use_ulysses_sp and not self.use_fused_kernels
+        assert micro_batch["position_ids"].dim() == 2
+        response_length = micro_batch["responses"].size(-1)
+        input_ids, attention = micro_batch["input_ids"], micro_batch["attention_mask"]
+        positions = micro_batch["position_ids"]
+        full = torch.zeros_like(input_ids, dtype=torch.bool)
+        full[:, -response_length - 1:-1] = sel_mask.bool()
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            if self.use_remove_padding:
+                ids, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention)
+                ids = ids.transpose(0, 1)
+                pos = index_first_axis(rearrange(positions.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+                selected = index_first_axis(rearrange(full.unsqueeze(-1), "b s ... -> (b s) ..."), indices).squeeze(-1).bool()
+                output = self.actor_module(input_ids=ids, attention_mask=None, position_ids=pos, use_cache=False)
+                logits = output.logits.squeeze(0)[selected]
+            else:
+                output = self.actor_module(input_ids=input_ids, attention_mask=attention,
+                                           position_ids=positions, use_cache=False)
+                logits = output.logits[full]
+        return logits.float() / temperature
+
+    def compute_topk_log_prob(self, data: DataProto, topk: int):
+        """Compute frozen-policy top-k distributions at valid response positions."""
+        self.actor_module.eval()
+        assert not data.meta_info["use_dynamic_bsz"]
+        batch = data.select(batch_keys=["responses", "input_ids", "attention_mask", "position_ids"]).batch
+        result_ids, result_lp = [], []
+        for micro in batch.split(data.meta_info["micro_batch_size"]):
+            mask = micro["attention_mask"][:, -micro["responses"].shape[-1]:].bool()
+            with torch.no_grad():
+                logits = self._forward_selected_logits(micro, data.meta_info["temperature"], mask)
+                chunks = []
+                for start in range(0, len(logits), 2048):
+                    chunks.append(torch.log_softmax(logits[start:start + 2048], -1).topk(topk, -1))
+                values = torch.cat([item.values for item in chunks])
+                indices = torch.cat([item.indices for item in chunks])
+            ids = torch.zeros((*mask.shape, topk), dtype=torch.int32, device=mask.device)
+            lp = torch.zeros((*mask.shape, topk), dtype=torch.float32, device=mask.device)
+            ids[mask], lp[mask] = indices.int(), values.float()
+            result_ids.append(ids); result_lp.append(lp)
+        return torch.cat(result_ids), torch.cat(result_lp)
+
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 
@@ -322,6 +367,11 @@ class DataParallelPPOActor(BasePPOActor):
         sdl_coef = data.meta_info.get("sdl_coef", self.config.get("sdl_loss_coef", 0.1))
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        use_ovcsd = self.config.get("use_ovcsd_loss", False)
+        if use_ovcsd:
+            assert not self.config.use_dynamic_bsz
+            select_keys += ["ovcsd_pg_mask", "ovcsd_suffix_weight",
+                            "teacher_topk_ids", "teacher_topk_logprobs"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -372,6 +422,8 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = data["loss_mask"][:, -response_length:]
                     else:
                         response_mask = attention_mask[:, -response_length:]
+                    if use_ovcsd:
+                        response_mask = response_mask * data["ovcsd_pg_mask"][:, None]
 
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
@@ -464,6 +516,36 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss / self.gradient_accumulation
                     loss.backward()
+
+                    if use_ovcsd:
+                        suffix_w = data["ovcsd_suffix_weight"]
+                        rows = suffix_w.sum(-1) > 0
+                        flag = torch.tensor(int(rows.any()), device=responses.device)
+                        if torch.distributed.is_initialized():
+                            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+                        if flag:
+                            sub = {key: value[rows] for key, value in data.items()
+                                   if isinstance(value, torch.Tensor) and value.shape[0] == len(rows)}
+                            sel = suffix_w[rows] > 0
+                            if not rows.any():
+                                sub = {key: value[:1] for key, value in data.items()
+                                       if isinstance(value, torch.Tensor) and value.shape[0] == len(rows)}
+                                sel = torch.zeros_like(suffix_w[:1], dtype=torch.bool)
+                            logits = self._forward_selected_logits(sub, temperature, sel)
+                            if sel.any():
+                                ids = sub["teacher_topk_ids"][sel].long()
+                                teacher_lp = sub["teacher_topk_logprobs"][sel]
+                                student_lp = logits.gather(-1, ids) - torch.logsumexp(logits, -1, keepdim=True)
+                                kl = topk_tail_kl(student_lp, teacher_lp)
+                                weights = suffix_w[rows][sel]
+                                scale = len(dataloader) * (torch.distributed.get_world_size()
+                                    if torch.distributed.is_initialized() else 1)
+                                suffix_loss = (kl * weights).sum() * scale
+                            else:
+                                suffix_loss = logits.sum() * 0
+                            (suffix_loss * self.config.get("ovcsd_suffix_coef", 1.0)).backward()
+                            append_to_dict(metrics, {"ovcsd/suffix_kl": suffix_loss.detach().item(),
+                                "ovcsd/suffix_loss": (suffix_loss * self.config.get("ovcsd_suffix_coef", 1.0)).detach().item()})
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),

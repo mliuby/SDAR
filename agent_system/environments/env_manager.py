@@ -679,7 +679,9 @@ def make_envs(config):
         _envs = build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
 
-        projection_f = partial(webshop_projection)
+        apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
+        require_think = apply_chat_template_kwargs.get("enable_thinking", True)
+        projection_f = partial(webshop_projection, require_think=require_think)
         envs = WebshopEnvironmentManager(_envs, projection_f, config)
         val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
         import time
