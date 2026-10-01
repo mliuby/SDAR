@@ -194,6 +194,13 @@ bash examples/search/retriever/retrieval_launch.sh > retrieval_server.log
 
 ### Training
 
+#### OVCSD
+
+The WebShop and ALFWorld launch scripts for Outcome-Verified Comparative
+Self-Distillation are available in `examples/ovcsd_trainer/`. See
+[`docs/ovcsd/README.md`](docs/ovcsd/README.md) for details about the method,
+configuration, and current limitations.
+
 #### 1. SDAR
 All scripts live under `examples/` and assume the repo root as working directory. You can run e.g.:
 
